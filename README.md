@@ -8,6 +8,8 @@
 
 This module is designed to be used as dependency for http based homebridge plugins. It exposes clients for http and mqtt.
 
+Supported Node.js major versions are 22, 24, and 26.
+
 It's generally used for my `homebridge-http-*` plugins like:
 * [homebridge-http-switch](https://github.com/Supereg/homebridge-http-switch)
 * [homebridge-http-lightbulb](https://github.com/Supereg/homebridge-http-lightbulb)

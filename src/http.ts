@@ -1,7 +1,8 @@
 import {Credentials, UrlObject} from "./configparser";
 import async = require("async");
-import request = require("request");
-import {AuthOptions, RequestCallback, Response} from "request";
+import axios, {AxiosResponse} from "axios";
+import {IncomingMessage} from "http";
+import {Agent as HttpsAgent} from "https";
 import {AsyncFunction} from "async";
 
 const delayPattern = /^delay\(\d+\)*$/;
@@ -30,9 +31,16 @@ export type ErrorResponseObject = {
 }
 
 export type ResponseObject = {
-    response: Response,
+    response: HttpResponse,
     body: string
 }
+
+export type HttpResponse = IncomingMessage & {
+    body: string
+    request: any
+}
+
+export type RequestCallback = (error: Error | null, response: HttpResponse | undefined, body: string | undefined) => void;
 
 export type BodyReplacer = {
     searchValue: string,
@@ -62,7 +70,7 @@ export function isHttpRedirectCode(statusCode: number) {
 export function httpRequest(urlObject: UrlObject, callback: RequestCallback, ...bodyReplacer: BodyReplacer[]) {
     let url = urlObject.url;
     let body = urlObject.body;
-    let auth: AuthOptions | undefined = undefined;
+    let auth: Credentials | undefined = undefined;
 
     if (urlObject.auth && urlObject.auth.username && urlObject.auth.password) {
         auth = {
@@ -81,27 +89,65 @@ export function httpRequest(urlObject: UrlObject, callback: RequestCallback, ...
         }
     });
 
-    request(
-        {
-            url: url,
-            body: body,
-            method: urlObject.method || "GET",
-            headers: urlObject.headers,
-            auth: auth,
-            strictSSL: urlObject.strictSSL,
-            timeout: urlObject.requestTimeout || 20000,
-        },
-        (error: any, response: Response, body: any) => {
-            callback(error, response, body);
+    const config = {
+        url,
+        data: body,
+        method: urlObject.method || "GET",
+        headers: urlObject.headers,
+        timeout: urlObject.requestTimeout || 20000,
+        responseType: "text" as const,
+        transformResponse: [(data: string) => data],
+        validateStatus: () => true,
+        maxRedirects: 10,
+        httpsAgent: new HttpsAgent({rejectUnauthorized: urlObject.strictSSL !== false}),
+    };
+
+    const deliverResponse = (response: AxiosResponse<string>) => {
+        const legacyResponse = (
+            (response.request && response.request.res) || {
+                statusCode: response.status,
+                statusMessage: response.statusText,
+                headers: response.headers,
+            }
+        ) as HttpResponse;
+        legacyResponse.body = response.data;
+        legacyResponse.request = response.request;
+        callback(null, legacyResponse, response.data);
+    };
+
+    const deliverError = (error: Error) => {
+        callback(error, undefined, undefined);
+    };
+
+    const requestWithAuth = () => axios.request<string>({
+        ...config,
+        auth: auth && {username: auth.username!, password: auth.password!},
+    });
+
+    const initialRequest = auth && auth.sendImmediately === false
+        ? axios.request<string>(config)
+        : requestWithAuth();
+
+    initialRequest.then(response => {
+        const authenticateHeader = response.headers["www-authenticate"];
+        const supportsBasicAuth = typeof authenticateHeader === "string"
+            ? /\bbasic\b/i.test(authenticateHeader)
+            : Array.isArray(authenticateHeader) && authenticateHeader.some(value => /\bbasic\b/i.test(value));
+
+        if (auth && auth.sendImmediately === false && response.status === 401 && supportsBasicAuth) {
+            requestWithAuth().then(deliverResponse, deliverError);
+            return;
         }
-    )
+
+        deliverResponse(response);
+    }, deliverError);
 }
 
 export function multipleHttpRequests(urlObjectArray: UrlObject[], callback: (result: (ErrorResponseObject | ResponseObject)[]) => void) {
     if (urlObjectArray.length === 0)
         throw new Error("Empty urlObject array");
 
-    const taskArray: AsyncFunction<Response, Error>[] = []; //Array<AsyncFunction<T, E>
+    const taskArray: AsyncFunction<HttpResponse, Error>[] = [];
     const executionCounter = [];
 
     for (let i = 0; i < urlObjectArray.length; i++) {
@@ -110,7 +156,7 @@ export function multipleHttpRequests(urlObjectArray: UrlObject[], callback: (res
         if (executionCounter[i] === undefined)
             executionCounter[i] = urlObject.repeat;
 
-        taskArray.push((callback: (error?: Error, response?: Response, body?: any) => void, delayed?: boolean) => {
+        taskArray.push((callback: (error?: Error, response?: HttpResponse, body?: any) => void, delayed?: boolean) => {
             if (urlObject.url.startsWith("delay") && delayPattern.test(urlObject.url)) {
                 if (multipleUrlExecutionStrategy !== ExecutionStrategy.SERIES) {
                     console.warn("There was a 'delay' method specified but execution is unaffected because of unsuitable execution strategy!");
@@ -132,7 +178,7 @@ export function multipleHttpRequests(urlObjectArray: UrlObject[], callback: (res
                 return;
             }
 
-            httpRequest(urlObject, callback);
+            httpRequest(urlObject, (error, response, body) => callback(error || undefined, response, body));
         });
 
         executionCounter[i]--;
